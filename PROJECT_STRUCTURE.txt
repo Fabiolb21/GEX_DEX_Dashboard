@@ -1,0 +1,25 @@
+📦 gex-dashboard/
+│
+├── 📄 START_HERE.md              ⭐ Comece por aqui!
+├── 📄 README.md                   📚 Documentação completa
+├── 📄 DEPLOYMENT.md               🚀 Guia de deployment
+├── 📄 ARCHITECTURE.md             🏗️ Arquitetura técnica
+├── 📄 LICENSE                     ⚖️ Licença MIT
+│
+├── 🐍 app.py                      ▶️ Aplicativo principal Streamlit
+├── 📋 requirements.txt            📦 Dependências Python
+│
+├── 🔒 .env.example                🔑 Template de variáveis de ambiente
+├── 🚫 .gitignore                  📝 Arquivos ignorados pelo Git
+│
+├── 📁 utils/                      🛠️ Módulos auxiliares
+│   ├── __init__.py
+│   ├── auth.py                    🔐 Autenticação Tastytrade
+│   ├── gex_calculator.py          📊 Cálculo de GEX
+│   └── websocket_manager.py       🌐 Gerenciador WebSocket
+│
+└── 📁 .streamlit/                 ⚙️ Configuração Streamlit
+    ├── config.toml                🎨 Configuração da UI
+    └── secrets.toml.example       🔑 Template de secrets
+
+ARQUIVOS TOTAIS: 16
