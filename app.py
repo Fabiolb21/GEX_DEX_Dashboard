@@ -77,19 +77,26 @@ PRESET_SYMBOLS = {
 
 DXFEED_URL = "wss://tasty-openapi-ws.dxfeed.com/realtime"
 
-# Vencimentos semanais/mensais gerados automaticamente (0DTE + proximos N)
 def generate_expirations(n: int = 8) -> list[str]:
-    """Gera lista de proximas N datas de expiracao (3as e 6as feiras + hoje)."""
-    exps = []
-    d = datetime.now()
-    seen = set()
+    """
+    Gera lista de vencimentos reais de opcoes americanas.
+
+    Regras:
+    - Sempre inclui HOJE como 1o vencimento (0DTE), independente do dia da semana.
+      Se hoje for fim de semana, o 0DTE real seria o dia util mais proximo,
+      mas mantemos hoje para o usuario decidir.
+    - Proximos vencimentos: todos os dias uteis (seg-sex), pois muitos ativos
+      (SPX, SPY, QQQ) tem opcoes diarias. Para indices com vencimento apenas
+      3as/6as, simbolos invalidos simplesmente nao retornam dados no dxFeed.
+    - Exclui sabados e domingos nos vencimentos futuros.
+    - Total: hoje + proximos N-1 dias uteis.
+    """
+    today = datetime.now()
+    exps  = [today.strftime("%y%m%d")]   # 0DTE sempre primeiro
+    d     = today + timedelta(days=1)
     while len(exps) < n:
-        # Opcoes normalmente vencem 3a (wed=2) e 6a (fri=4)
-        if d.weekday() in (2, 4) or (len(exps) == 0 and d.weekday() <= 4):
-            s = d.strftime("%y%m%d")
-            if s not in seen:
-                seen.add(s)
-                exps.append(s)
+        if d.weekday() < 5:              # 0=seg … 4=sex
+            exps.append(d.strftime("%y%m%d"))
         d += timedelta(days=1)
     return exps
 
@@ -492,11 +499,11 @@ def main():
             n_exps = st.number_input(
                 "Quantos vencimentos incluir",
                 min_value=2, max_value=20, value=4, step=1,
-                help="Conta a partir de hoje (0DTE se existir + proximos vencimentos semanais/mensais)."
+                help="Inclui 0DTE (hoje) + proximos N-1 dias uteis. Simbolos sem liquidez simplesmente nao retornam dados."
             )
             all_exps = generate_expirations(n_exps)
             st.caption(
-                f"{len(all_exps)} vencimentos: "
+                f"{len(all_exps)} vencimentos (0DTE incluso): "
                 f"{exp_label(all_exps[0])} → {exp_label(all_exps[-1])}"
             )
 
