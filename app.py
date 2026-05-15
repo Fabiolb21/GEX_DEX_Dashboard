@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from websocket import create_connection
 import pandas as pd
 import plotly.graph_objects as go
-from utils.auth import ensure_streamer_token, get_access_token as _auth_get_token
+from utils.auth import ensure_streamer_token
 from utils.gex_calculator import GEXCalculator, parse_option_symbol
 
 st.set_page_config(page_title="GEX + DEX Dashboard", page_icon="📊", layout="wide")
@@ -117,26 +117,20 @@ class DEXCalculator:
 # ==============================================================================
 # Tastytrade REST — cadeia de opcoes
 # ==============================================================================
-
-
-@st.cache_data(ttl=840, show_spinner=False)
-def _get_tasty_session_token() -> str:
-    """
-    Obtém access_token da Tastytrade usando exatamente o mesmo fluxo do auth.py:
-      POST /oauth/token  com  grant_type=refresh_token  (form-encoded, sem Bearer).
-    Retorna o access_token para ser usado como: Authorization: Bearer <token>
-    """
-    # Reutiliza get_access_token() do auth.py — já testado e funcional
-    token = _auth_get_token()
-    if not token:
-        raise RuntimeError("get_access_token() retornou vazio")
-    return token
+# Tastytrade REST — cadeia de opcoes via /option-chains (sem senha)
+# Usa o mesmo access_token OAuth que já funciona para o WebSocket
+# ==============================================================================
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_option_chain(symbol: str) -> dict:
     """
-    Busca a cadeia completa de opcoes do ticker via API Tastytrade.
+    Busca a cadeia completa de opcoes do ticker via API Tastytrade REST.
+
+    Autenticacao: mesmo access_token do OAuth (CLIENT_ID + REFRESH_TOKEN)
+    passado como  Authorization: Bearer <token>  — identico ao que o auth.py
+    usa para obter o streamer token em api.tastyworks.com.
+
     Retorna dict com:
       - expirations        : lista de "YYYY-MM-DD"
       - strikes_by_exp     : { "YYYY-MM-DD": [float, ...] }
@@ -144,50 +138,43 @@ def fetch_option_chain(symbol: str) -> dict:
       - is_index           : bool
     """
     try:
-        access_token = _get_tasty_session_token()
-
-        # auth.py confirma: header correto é "Bearer <token>"
-        # (visto em get_streamer_token: Authorization: f"Bearer {access_token}")
+        # get_access_token() do auth.py obtém o JWT OAuth via refresh_token.
+        # A API REST da Tastytrade aceita esse token com prefixo Bearer.
+        # Mesmo token usado em get_streamer_token() do auth.py original.
+        from utils.auth import get_access_token
+        access_token = get_access_token()
         headers = {"Authorization": f"Bearer {access_token}"}
 
-        # Testa a autenticação antes de buscar a chain
-        test = requests.get(
-            f"{TASTY_API_URL}/customers/me",
-            headers=headers,
-            timeout=10,
-        )
-        if test.status_code == 401:
-            _get_tasty_session_token.clear()
-            return {
-                "error": (
-                    f"Autenticacao recusada (401) em /customers/me. "
-                    f"Resposta: {test.text[:300]}"
-                )
-            }
-
-        # Endpoint nested retorna estrutura agrupada por expiracao
+        # Endpoint /nested retorna strikes agrupados por expiracao — ideal
         url  = f"{TASTY_API_URL}/option-chains/{symbol.upper()}/nested"
         resp = requests.get(url, headers=headers, timeout=15)
 
+        # Fallback para endpoint flat
         if resp.status_code == 404:
             url  = f"{TASTY_API_URL}/option-chains/{symbol.upper()}"
             resp = requests.get(url, headers=headers, timeout=15)
 
+        if resp.status_code == 401:
+            return {"error": (
+                "Token OAuth recusado pela API REST (401).\n"
+                f"Detalhe: {resp.text[:300]}"
+            )}
+
         if resp.status_code != 200:
-            return {"error": f"HTTP {resp.status_code} — ticker nao encontrado ou sem opcoes"}
+            return {"error": f"HTTP {resp.status_code} ao buscar cadeia de {symbol}. "
+                             f"Detalhe: {resp.text[:200]}"}
 
         payload = resp.json().get("data", {})
         items   = payload.get("items", []) if isinstance(payload, dict) else []
 
         if not items:
-            return {"error": "Cadeia vazia — verifique se o ticker possui opcoes listadas"}
+            return {"error": f"Cadeia vazia para {symbol} — verifique se o ticker possui opcoes listadas"}
 
         expirations: list    = []
         strikes_by_exp: dict = {}
         option_prefix        = symbol.upper()
 
         for chain in items:
-            # Prefixo do root symbol (ex: SPXW para SPX)
             root = (chain.get("option-root-symbol")
                     or chain.get("underlying-symbol")
                     or symbol.upper())
@@ -204,7 +191,6 @@ def fetch_option_chain(symbol: str) -> dict:
             if exp_str not in expirations:
                 expirations.append(exp_str)
 
-            # Strikes podem estar em "strikes" ou nas opcoes individuais
             raw_strikes = chain.get("strikes", [])
             values = []
             for s in raw_strikes:
@@ -222,7 +208,7 @@ def fetch_option_chain(symbol: str) -> dict:
                 strikes_by_exp[exp_str] = sorted(set(values))
 
         if not expirations:
-            return {"error": "Nenhuma expiracao encontrada — tente outro ticker"}
+            return {"error": f"Nenhuma expiracao encontrada para {symbol}"}
 
         expirations.sort()
         is_index = symbol.upper() in {
@@ -236,10 +222,8 @@ def fetch_option_chain(symbol: str) -> dict:
             "is_index":       is_index,
         }
 
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Erro de rede: {e}"}
     except Exception as e:
-        return {"error": f"Erro inesperado: {e}"}
+        return {"error": f"Erro ao buscar cadeia: {e}"}
 
 
 def exp_to_dxfeed(exp_date: str) -> str:
@@ -598,7 +582,6 @@ def main():
                 st.session_state.chain        = None
                 st.session_state.data_fetched = False
                 fetch_option_chain.clear()
-                _get_tasty_session_token.clear()
                 with st.spinner(f"Buscando cadeia de {ticker_input}..."):
                     chain = fetch_option_chain(ticker_input)
                 if "error" in chain:
@@ -615,37 +598,6 @@ def main():
             else:
                 st.warning("Digite um ticker antes de buscar.")
 
-        # Botão de diagnóstico de credenciais
-        with st.expander("🔧 Diagnóstico de credenciais"):
-            if st.button("Testar autenticação", use_container_width=True):
-                _get_tasty_session_token.clear()
-                diag_lines = []
-                import os
-                for key in ["CLIENT_ID", "CLIENT_SECRET", "REFRESH_TOKEN"]:
-                    try:
-                        val = st.secrets.get(key, "")
-                        src = "st.secrets"
-                    except Exception:
-                        val = os.environ.get(key, "")
-                        src = ".env"
-                    if val:
-                        diag_lines.append(f"✅ {key} encontrado em {src} ({len(val)} chars)")
-                    else:
-                        diag_lines.append(f"❌ {key} NÃO encontrado")
-                st.code("\n".join(diag_lines))
-
-                try:
-                    tok = _get_tasty_session_token()
-                    st.success(f"✅ Token obtido com sucesso ({len(tok)} chars)")
-                    # Testa chamada real
-                    test = requests.get(
-                        f"{TASTY_API_URL}/customers/me",
-                        headers={"Authorization": tok},
-                        timeout=10,
-                    )
-                    st.code(f"GET /customers/me → HTTP {test.status_code}\n{test.text[:400]}")
-                except Exception as ex:
-                    st.error(str(ex))
 
         chain = st.session_state.chain
 
