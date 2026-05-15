@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from websocket import create_connection
 import pandas as pd
 import plotly.graph_objects as go
-from utils.auth import ensure_streamer_token
+from utils.auth import ensure_streamer_token, get_access_token as _auth_get_token
 from utils.gex_calculator import GEXCalculator, parse_option_symbol
 
 st.set_page_config(page_title="GEX + DEX Dashboard", page_icon="📊", layout="wide")
@@ -119,54 +119,18 @@ class DEXCalculator:
 # ==============================================================================
 
 
-@st.cache_data(ttl=1200, show_spinner=False)
+@st.cache_data(ttl=840, show_spinner=False)
 def _get_tasty_session_token() -> str:
     """
-    Faz login na API Tastytrade via POST /sessions e retorna o session-token.
-    A API usa o token diretamente no header Authorization (sem prefixo Bearer).
-    Credenciais lidas dos st.secrets (Streamlit Cloud) ou variáveis de ambiente.
+    Obtém access_token da Tastytrade usando exatamente o mesmo fluxo do auth.py:
+      POST /oauth/token  com  grant_type=refresh_token  (form-encoded, sem Bearer).
+    Retorna o access_token para ser usado como: Authorization: Bearer <token>
     """
-    import os
-
-    # Tenta st.secrets primeiro (Streamlit Cloud), depois env vars (local)
-    def _get(key: str) -> str:
-        try:
-            return st.secrets[key]
-        except Exception:
-            pass
-        val = os.environ.get(key, "")
-        if not val:
-            raise ValueError(
-                f"Credencial '{key}' nao encontrada em st.secrets nem em variavel de ambiente. "
-                "Configure CLIENT_ID, CLIENT_SECRET e REFRESH_TOKEN."
-            )
-        return val
-
-    client_id     = _get("CLIENT_ID")
-    client_secret = _get("CLIENT_SECRET")
-    refresh_token = _get("REFRESH_TOKEN")
-
-    # 1. Troca refresh_token por access_token via OAuth
-    oauth_resp = requests.post(
-        f"{TASTY_API_URL}/oauth/token",
-        json={
-            "grant_type":    "refresh_token",
-            "client_id":     client_id,
-            "client_secret": client_secret,
-            "refresh_token": refresh_token,
-        },
-        headers={"Content-Type": "application/json"},
-        timeout=15,
-    )
-    if oauth_resp.status_code != 200:
-        raise RuntimeError(
-            f"OAuth falhou ({oauth_resp.status_code}): {oauth_resp.text[:200]}"
-        )
-    access_token = oauth_resp.json().get("access_token", "")
-    if not access_token:
-        raise RuntimeError("access_token vazio na resposta OAuth")
-
-    return access_token
+    # Reutiliza get_access_token() do auth.py — já testado e funcional
+    token = _auth_get_token()
+    if not token:
+        raise RuntimeError("get_access_token() retornou vazio")
+    return token
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -181,8 +145,25 @@ def fetch_option_chain(symbol: str) -> dict:
     """
     try:
         access_token = _get_tasty_session_token()
-        # A API Tastytrade aceita o access_token diretamente — sem prefixo "Bearer"
-        headers = {"Authorization": access_token}
+
+        # auth.py confirma: header correto é "Bearer <token>"
+        # (visto em get_streamer_token: Authorization: f"Bearer {access_token}")
+        headers = {"Authorization": f"Bearer {access_token}"}
+
+        # Testa a autenticação antes de buscar a chain
+        test = requests.get(
+            f"{TASTY_API_URL}/customers/me",
+            headers=headers,
+            timeout=10,
+        )
+        if test.status_code == 401:
+            _get_tasty_session_token.clear()
+            return {
+                "error": (
+                    f"Autenticacao recusada (401) em /customers/me. "
+                    f"Resposta: {test.text[:300]}"
+                )
+            }
 
         # Endpoint nested retorna estrutura agrupada por expiracao
         url  = f"{TASTY_API_URL}/option-chains/{symbol.upper()}/nested"
@@ -616,8 +597,8 @@ def main():
                 st.session_state.chain_symbol = ticker_input
                 st.session_state.chain        = None
                 st.session_state.data_fetched = False
-                # Limpa cache do Streamlit para este ticker
                 fetch_option_chain.clear()
+                _get_tasty_session_token.clear()
                 with st.spinner(f"Buscando cadeia de {ticker_input}..."):
                     chain = fetch_option_chain(ticker_input)
                 if "error" in chain:
@@ -633,6 +614,38 @@ def main():
                     )
             else:
                 st.warning("Digite um ticker antes de buscar.")
+
+        # Botão de diagnóstico de credenciais
+        with st.expander("🔧 Diagnóstico de credenciais"):
+            if st.button("Testar autenticação", use_container_width=True):
+                _get_tasty_session_token.clear()
+                diag_lines = []
+                import os
+                for key in ["CLIENT_ID", "CLIENT_SECRET", "REFRESH_TOKEN"]:
+                    try:
+                        val = st.secrets.get(key, "")
+                        src = "st.secrets"
+                    except Exception:
+                        val = os.environ.get(key, "")
+                        src = ".env"
+                    if val:
+                        diag_lines.append(f"✅ {key} encontrado em {src} ({len(val)} chars)")
+                    else:
+                        diag_lines.append(f"❌ {key} NÃO encontrado")
+                st.code("\n".join(diag_lines))
+
+                try:
+                    tok = _get_tasty_session_token()
+                    st.success(f"✅ Token obtido com sucesso ({len(tok)} chars)")
+                    # Testa chamada real
+                    test = requests.get(
+                        f"{TASTY_API_URL}/customers/me",
+                        headers={"Authorization": tok},
+                        timeout=10,
+                    )
+                    st.code(f"GET /customers/me → HTTP {test.status_code}\n{test.text[:400]}")
+                except Exception as ex:
+                    st.error(str(ex))
 
         chain = st.session_state.chain
 
