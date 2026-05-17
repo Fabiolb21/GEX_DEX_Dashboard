@@ -77,27 +77,69 @@ PRESET_SYMBOLS = {
 
 DXFEED_URL = "wss://tasty-openapi-ws.dxfeed.com/realtime"
 
-def generate_expirations(n: int = 8) -> list[str]:
+def generate_expirations_full(horizon_days: int = 365) -> list[str]:
     """
-    Gera lista de vencimentos reais de opcoes americanas.
+    Gera a lista completa de vencimentos cobrindo todos os tipos
+    presentes na cadeia da Tastytrade:
 
-    Regras:
-    - Sempre inclui HOJE como 1o vencimento (0DTE), independente do dia da semana.
-      Se hoje for fim de semana, o 0DTE real seria o dia util mais proximo,
-      mas mantemos hoje para o usuario decidir.
-    - Proximos vencimentos: todos os dias uteis (seg-sex), pois muitos ativos
-      (SPX, SPY, QQQ) tem opcoes diarias. Para indices com vencimento apenas
-      3as/6as, simbolos invalidos simplesmente nao retornam dados no dxFeed.
-    - Exclui sabados e domingos nos vencimentos futuros.
-    - Total: hoje + proximos N-1 dias uteis.
+      0DTE       : hoje (sempre primeiro)
+      Diários    : todos os dias uteis nas primeiras 5 semanas
+      Semanais   : todas as 6as-feiras de 35 a 90 dias
+      Mensais    : 3a sexta-feira de cada mes ate horizon_days
+                   (padrao OPEX — cobre AM, PM e trimestrais)
+
+    Ativos sem opcoes em determinada data simplesmente nao retornam
+    dados no dxFeed, sem gerar erro.
     """
-    today = datetime.now()
-    exps  = [today.strftime("%y%m%d")]   # 0DTE sempre primeiro
-    d     = today + timedelta(days=1)
-    while len(exps) < n:
-        if d.weekday() < 5:              # 0=seg … 4=sex
-            exps.append(d.strftime("%y%m%d"))
+    import calendar as _cal
+    today = datetime.now().date()
+    seen  = set()
+    exps  = []
+
+    def _add(d):
+        s = d.strftime("%y%m%d")
+        if s not in seen and d >= today:
+            seen.add(s)
+            exps.append(s)
+
+    end = today + timedelta(days=horizon_days)
+
+    # 0DTE — sempre primeiro
+    _add(today)
+
+    # Diarios: todos os dias uteis nas primeiras 5 semanas
+    d = today + timedelta(days=1)
+    cutoff_daily = today + timedelta(days=35)
+    while d <= cutoff_daily:
+        if d.weekday() < 5:
+            _add(d)
         d += timedelta(days=1)
+
+    # Semanais: todas as 6as de 35 a 90 dias
+    d = cutoff_daily + timedelta(days=1)
+    cutoff_weekly = today + timedelta(days=90)
+    while d <= cutoff_weekly:
+        if d.weekday() == 4:
+            _add(d)
+        d += timedelta(days=1)
+
+    # Mensais: 3a sexta-feira de cada mes (OPEX)
+    year, month = today.year, today.month
+    while True:
+        first_day    = datetime(year, month, 1).date()
+        dow_first    = first_day.weekday()
+        days_to_fri  = (4 - dow_first) % 7
+        first_fri    = first_day + timedelta(days=days_to_fri)
+        third_fri    = first_fri + timedelta(weeks=2)
+        if third_fri > end:
+            break
+        _add(third_fri)
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+
+    exps.sort()
     return exps
 
 
@@ -495,17 +537,53 @@ def main():
             st.caption(f"Vencimento: {exp_label(expiration)}")
 
         else:
-            # Acumulado: seleciona quantos vencimentos futuros incluir
-            n_exps = st.number_input(
-                "Quantos vencimentos incluir",
-                min_value=2, max_value=20, value=4, step=1,
-                help="Inclui 0DTE (hoje) + proximos N-1 dias uteis. Simbolos sem liquidez simplesmente nao retornam dados."
+            # Acumulado: mostra todos os vencimentos reais
+            all_exps_full = generate_expirations_full(365)
+
+            # Agrupa por categoria para facilitar selecao
+            from datetime import date as _date
+            today_d = datetime.now().date()
+            cut35   = today_d + timedelta(days=35)
+            cut90   = today_d + timedelta(days=90)
+
+            def _cat(e):
+                d = datetime.strptime(e, "%y%m%d").date()
+                if d == today_d:         return "0DTE (hoje)"
+                elif d <= cut35:         return "Diarios (ate 5 sem)"
+                elif d <= cut90:         return "Semanais (5 sem - 90d)"
+                else:                    return "Mensais (90d+)"
+
+            # Filtro por categoria
+            cats_disponiveis = ["0DTE (hoje)", "Diarios (ate 5 sem)",
+                                "Semanais (5 sem - 90d)", "Mensais (90d+)"]
+            cats_sel = st.multiselect(
+                "Categorias de vencimento",
+                cats_disponiveis,
+                default=["0DTE (hoje)", "Diarios (ate 5 sem)", "Semanais (5 sem - 90d)", "Mensais (90d+)"],
+                help="Selecione quais grupos de vencimento incluir no acumulado."
             )
-            all_exps = generate_expirations(n_exps)
-            st.caption(
-                f"{len(all_exps)} vencimentos (0DTE incluso): "
-                f"{exp_label(all_exps[0])} → {exp_label(all_exps[-1])}"
+
+            all_exps_filtered = [e for e in all_exps_full if _cat(e) in cats_sel]
+
+            # Multiselect individual (com todos pre-selecionados)
+            all_exps = st.multiselect(
+                f"Vencimentos ({len(all_exps_filtered)} disponiveis)",
+                options=all_exps_filtered,
+                default=all_exps_filtered,
+                format_func=lambda e: (
+                    f"[0DTE] {exp_label(e)}" if e == datetime.now().strftime("%y%m%d")
+                    else exp_label(e)
+                ),
+                help="Desmarque vencimentos especificos para excluir da coleta."
             )
+
+            if all_exps:
+                st.caption(
+                    f"{len(all_exps)} vencimentos selecionados: "
+                    f"{exp_label(all_exps[0])} → {exp_label(all_exps[-1])}"
+                )
+            else:
+                st.warning("Selecione ao menos um vencimento.")
 
         # ── Strikes ───────────────────────────────────────────────────────────
         st.subheader("\U0001f3af Strikes")
@@ -529,8 +607,10 @@ def main():
 
         st.divider()
 
-        btn_label = "\U0001f504 Buscar Dados" if not is_acumulado else "\U0001f504 Buscar Acumulado"
-        if st.button(btn_label, type="primary", use_container_width=True):
+        btn_label    = "\U0001f504 Buscar Dados" if not is_acumulado else "\U0001f504 Buscar Acumulado"
+        btn_disabled = is_acumulado and (not all_exps if is_acumulado else False)
+        if st.button(btn_label, type="primary", use_container_width=True,
+                     disabled=btn_disabled):
             with st.spinner("Conectando ao Tastytrade..."):
                 try:
                     token = ensure_streamer_token()
