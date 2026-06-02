@@ -73,6 +73,7 @@ PRESET_SYMBOLS = {
     "SOFI":  {"option_prefix": "SOFI",  "default_price": 50,    "increment": 1},
     "SNAP":  {"option_prefix": "SNAP",  "default_price": 50,    "increment": 1},
     "SHOP":  {"option_prefix": "SHOP",  "default_price": 50,    "increment": 1},
+    "SPCE":  {"option_prefix": "SPCE",  "default_price": 50,    "increment": 1},
 }
 
 DXFEED_URL = "wss://tasty-openapi-ws.dxfeed.com/realtime"
