@@ -4,14 +4,6 @@ import time
 import requests
 from dotenv import load_dotenv
 
-import socket
-try:
-    print(f"DEBUG: Resolvendo IP para {BASE_URL}")
-    hostname = BASE_URL.replace("https://", "" )
-    print(f"DEBUG: IP resolvido: {socket.gethostbyname(hostname)}")
-except Exception as e:
-    print(f"DEBUG: Falha no DNS: {e}")
-
 # Token file paths
 TOKEN_FILE = "tasty_token.json"
 STREAMER_TOKEN_FILE = "streamer_token.json"
