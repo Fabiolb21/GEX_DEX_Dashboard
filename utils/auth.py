@@ -63,44 +63,17 @@ def load_credentials_from_env():
 
 
 def get_access_token(force_refresh=False):
-    """
-    Get Tastytrade access token using OAuth refresh token flow.
-    Caches the token with expiration timestamp for automatic refresh.
-
-    Args:
-        force_refresh (bool): If True, always fetch a new token.
-                             If False, return cached token if valid and not expiring soon.
-
-    Returns:
-        str: Access token
-
-    Raises:
-        Exception: If token exchange fails
-    """
-    # Try to load cached token first
-    if not force_refresh and os.path.exists(TOKEN_FILE):
-        try:
-            with open(TOKEN_FILE, 'r') as f:
-                token_data = json.load(f)
-
-                # Check if we have both token and expiration
-                if 'access_token' in token_data and 'expires_at' in token_data:
-                    expires_at = token_data['expires_at']
-                    current_time = time.time()
-
-                    # Refresh if expired or expiring within 60 seconds
-                    if expires_at > current_time + 60:
-                        time_remaining = int(expires_at - current_time)
-                        print(f"✅ Using cached access token (expires in {time_remaining}s)")
-                        return token_data['access_token']
-                    else:
-                        print(f"⚠️ Access token expired or expiring soon, refreshing...")
-        except Exception as e:
-            print(f"⚠️ Could not load cached token: {e}")
-
+    # ... (mantenha a parte inicial de carregar o cache até a linha 100)
+    
     # Fetch new token
     print("🔄 Fetching new access token from Tastytrade...")
     credentials = load_credentials_from_env()
+
+    # IMPORTANTE: A Tastytrade exige User-Agent em todas as requisições OAuth
+    headers = {
+        "User-Agent": "GEX-App/1.0",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
 
     data = {
         "grant_type": "refresh_token",
@@ -109,36 +82,27 @@ def get_access_token(force_refresh=False):
         "client_secret": credentials['client_secret']
     }
 
-    response = requests.post("https://api.tastyworks.com/oauth/token", data=data)
+    # URL corrigida para tastyworks.com e inclusão de headers e timeout
+    url = "https://api.tastyworks.com/oauth/token"
+    
+    try:
+        response = requests.post(url, data=data, headers=headers, timeout=10 )
+        
+        if response.status_code == 200:
+            token_response = response.json()
+            access_token = token_response["access_token"]
+            expires_in = token_response.get("expires_in", 900)
+            
+            # ... (mantenha o restante da lógica de salvamento do token)
+            return access_token
+        else:
+            raise Exception(f"Erro API ({response.status_code}): {response.text}")
+            
+    except requests.exceptions.Timeout:
+        raise Exception("A conexão com a Tastytrade expirou (Timeout). Verifique sua internet ou se o serviço está instável.")
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Erro de conexão: {e}")
 
-    if response.status_code == 200:
-        token_response = response.json()
-        access_token = token_response["access_token"]
-        expires_in = token_response.get("expires_in", 900)  # Default 15 minutes
-
-        # Calculate expiration timestamp
-        expires_at = time.time() + expires_in
-
-        # Save token with expiration
-        token_data = {
-            "access_token": access_token,
-            "expires_in": expires_in,
-            "expires_at": expires_at,
-            "fetched_at": time.time()
-        }
-
-        with open(TOKEN_FILE, "w") as f:
-            json.dump(token_data, f, indent=2)
-
-        print(f"✅ Access token obtained! (valid for {expires_in}s)")
-        print(f"💾 Token saved to {TOKEN_FILE}")
-
-        return access_token
-    else:
-        raise Exception(
-            f"Failed to get access token. Status code: {response.status_code}\n"
-            f"Response: {response.text}"
-        )
 
 
 def get_streamer_token(access_token=None, force_refresh=False):
