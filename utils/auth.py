@@ -109,7 +109,7 @@ def get_access_token(force_refresh=False):
         "client_secret": credentials['client_secret']
     }
 
-    response = requests.post("https://api.tastytrade.com/oauth/token", data=data)
+    response = requests.post("https://api.tastyworks.com/oauth/token", data=data)
 
     if response.status_code == 200:
         token_response = response.json()
