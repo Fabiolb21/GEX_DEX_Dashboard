@@ -94,7 +94,11 @@ PRESET_SYMBOLS = {
     "SNDK":  {"option_prefix": "SNDK",  "default_price": 50,    "increment": 1},
 }
 
-DXFEED_URL = "wss://tasty-openapi-ws.dxfeed.com/realtime"
+# URLs WebSocket em ordem de tentativa
+DXFEED_URLS = [
+    "wss://tasty-openapi-ws.dxfeed.com/realtime",
+    "wss://streamer.dxfeed.com/",
+]
  
 def generate_expirations_full(horizon_days: int = 365) -> list[str]:
     """
@@ -229,50 +233,64 @@ class DEXCalculator:
  
  
 # WebSocket helpers (identicos ao original)
-def connect_websocket(token, retries=3):
-    """Conecta ao dxFeed WebSocket com retry automatico."""
-    last_error = None
-    for attempt in range(1, retries + 1):
+def _try_connect(url: str, token: str) -> object:
+    """Tenta conectar a uma URL especifica do dxFeed."""
+    ws = create_connection(url, timeout=30)
+    ws.send(json.dumps({
+        "type": "SETUP", "channel": 0,
+        "keepaliveTimeout": 60, "acceptKeepaliveTimeout": 60, "version": "1.0.0"
+    }))
+    ws.recv()
+ 
+    ws.settimeout(15)
+    for _ in range(10):
         try:
-            ws = create_connection(DXFEED_URL, timeout=30)  # timeout aumentado
-            ws.send(json.dumps({
-                "type": "SETUP", "channel": 0,
-                "keepaliveTimeout": 60, "acceptKeepaliveTimeout": 60, "version": "1.0.0"
-            }))
-            ws.recv()
+            msg = json.loads(ws.recv())
+        except Exception:
+            break
+        if msg.get("type") == "AUTH_STATE":
+            if msg["state"] == "UNAUTHORIZED":
+                ws.send(json.dumps({"type": "AUTH", "channel": 0, "token": token}))
+            elif msg["state"] == "AUTHORIZED":
+                break
  
-            # Auth loop com timeout individual por mensagem
-            ws.settimeout(15)
-            auth_attempts = 0
-            while auth_attempts < 10:
-                try:
-                    msg = json.loads(ws.recv())
-                except Exception:
-                    break
-                if msg.get("type") == "AUTH_STATE":
-                    if msg["state"] == "UNAUTHORIZED":
-                        ws.send(json.dumps({"type": "AUTH", "channel": 0, "token": token}))
-                    elif msg["state"] == "AUTHORIZED":
-                        break
-                auth_attempts += 1
+    ws.send(json.dumps({
+        "type": "CHANNEL_REQUEST", "channel": 1,
+        "service": "FEED", "parameters": {"contract": "AUTO"}
+    }))
+    ws.settimeout(10)
+    ws.recv()
+    return ws
  
-            ws.send(json.dumps({
-                "type": "CHANNEL_REQUEST", "channel": 1,
-                "service": "FEED", "parameters": {"contract": "AUTO"}
-            }))
-            ws.settimeout(10)
-            ws.recv()
-            return ws
  
-        except Exception as e:
-            last_error = e
-            if attempt < retries:
-                time.sleep(2 * attempt)   # backoff: 2s, 4s
+def connect_websocket(token, extra_urls=None):
+    """
+    Conecta ao dxFeed tentando cada URL da lista em sequencia.
+    Cada URL tem 2 tentativas com backoff antes de passar para a proxima.
+    """
+    urls = list(DXFEED_URLS)
+    if extra_urls:
+        for u in extra_urls:
+            if u not in urls:
+                urls.insert(0, u)   # URL dinamica da API tem prioridade
+ 
+    last_error = None
+    for url in urls:
+        for attempt in range(1, 3):   # 2 tentativas por URL
+            try:
+                ws = _try_connect(url, token)
+                return ws            # sucesso
+            except Exception as e:
+                last_error = e
+                if attempt == 1:
+                    time.sleep(2)
                 continue
  
     raise Exception(
-        f"Nao foi possivel conectar ao dxFeed apos {retries} tentativas. "
-        f"Ultimo erro: {last_error}"
+        f"Nao foi possivel conectar ao dxFeed.\n"
+        f"URLs tentadas: {urls}\n"
+        f"Ultimo erro: {last_error}\n"
+        "Verifique sua conexao com a internet."
     )
  
  
@@ -662,7 +680,19 @@ def main():
             with st.spinner("Conectando ao Tastytrade..."):
                 try:
                     token = ensure_streamer_token()
-                    ws    = connect_websocket(token)
+                    # Tenta obter websocket-url dinamico retornado pela API
+                    _extra_urls = []
+                    try:
+                        import json as _j
+                        _td = _j.load(open("streamer_token.json"))
+                        _wu = _td.get("websocket-url") or _td.get("dxlink-url") or ""
+                        if _wu:
+                            if not _wu.endswith("/realtime"):
+                                _wu = _wu.rstrip("/") + "/realtime"
+                            _extra_urls = [_wu]
+                    except Exception:
+                        pass
+                    ws = connect_websocket(token, extra_urls=_extra_urls)
  
                     # Preco do underlying
                     st.info(f"Buscando preco de {symbol}...")
@@ -1026,4 +1056,3 @@ def main():
  
 if __name__ == "__main__":
     main()
-
