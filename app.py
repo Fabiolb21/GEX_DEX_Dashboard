@@ -95,18 +95,18 @@ PRESET_SYMBOLS = {
 }
 
 DXFEED_URL = "wss://tasty-openapi-ws.dxfeed.com/realtime"
-
+ 
 def generate_expirations_full(horizon_days: int = 365) -> list[str]:
     """
     Gera a lista completa de vencimentos cobrindo todos os tipos
     presentes na cadeia da Tastytrade:
-
+ 
       0DTE       : hoje (sempre primeiro)
       Diários    : todos os dias uteis nas primeiras 5 semanas
       Semanais   : todas as 6as-feiras de 35 a 90 dias
       Mensais    : 3a sexta-feira de cada mes ate horizon_days
                    (padrao OPEX — cobre AM, PM e trimestrais)
-
+ 
     Ativos sem opcoes em determinada data simplesmente nao retornam
     dados no dxFeed, sem gerar erro.
     """
@@ -114,18 +114,18 @@ def generate_expirations_full(horizon_days: int = 365) -> list[str]:
     today = datetime.now().date()
     seen  = set()
     exps  = []
-
+ 
     def _add(d):
         s = d.strftime("%y%m%d")
         if s not in seen and d >= today:
             seen.add(s)
             exps.append(s)
-
+ 
     end = today + timedelta(days=horizon_days)
-
+ 
     # 0DTE — sempre primeiro
     _add(today)
-
+ 
     # Diarios: todos os dias uteis nas primeiras 5 semanas
     d = today + timedelta(days=1)
     cutoff_daily = today + timedelta(days=35)
@@ -133,7 +133,7 @@ def generate_expirations_full(horizon_days: int = 365) -> list[str]:
         if d.weekday() < 5:
             _add(d)
         d += timedelta(days=1)
-
+ 
     # Semanais: todas as 6as de 35 a 90 dias
     d = cutoff_daily + timedelta(days=1)
     cutoff_weekly = today + timedelta(days=90)
@@ -141,7 +141,7 @@ def generate_expirations_full(horizon_days: int = 365) -> list[str]:
         if d.weekday() == 4:
             _add(d)
         d += timedelta(days=1)
-
+ 
     # Mensais: 3a sexta-feira de cada mes (OPEX)
     year, month = today.year, today.month
     while True:
@@ -157,18 +157,18 @@ def generate_expirations_full(horizon_days: int = 365) -> list[str]:
         if month > 12:
             month = 1
             year += 1
-
+ 
     exps.sort()
     return exps
-
-
+ 
+ 
 class DEXCalculator:
     """Delta Exposure: DEX = |delta| x OI x 100 x spot"""
-
+ 
     def __init__(self, spot_price: float):
         self.spot_price = spot_price
         self._data: dict = {}
-
+ 
     def update_delta(self, symbol: str, delta, oi) -> None:
         if delta is None or oi is None:
             return
@@ -179,7 +179,7 @@ class DEXCalculator:
         if math.isnan(delta) or math.isnan(oi):
             return
         self._data[symbol] = {"delta": delta, "oi": oi}
-
+ 
     def get_dex_by_strike(self) -> pd.DataFrame:
         rows: dict = {}
         for sym, d in self._data.items():
@@ -206,7 +206,7 @@ class DEXCalculator:
              "call_oi": v["call_oi"], "put_oi": v["put_oi"]}
             for s, v in rows.items()
         ]).sort_values("strike").reset_index(drop=True)
-
+ 
     def get_total_dex_metrics(self) -> dict:
         df = self.get_dex_by_strike()
         if df.empty:
@@ -226,36 +226,65 @@ class DEXCalculator:
         return {"total_call_dex": total_call, "total_put_dex": total_put,
                 "net_dex": total_call - total_put, "num_options": len(self._data),
                 "max_dex_strike": max_strike, "zero_delta": zero_delta}
-
-
+ 
+ 
 # WebSocket helpers (identicos ao original)
-def connect_websocket(token):
-    ws = create_connection(DXFEED_URL, timeout=10)
-    ws.send(json.dumps({"type": "SETUP", "channel": 0,
-                        "keepaliveTimeout": 60, "acceptKeepaliveTimeout": 60, "version": "1.0.0"}))
-    ws.recv()
-    while True:
-        msg = json.loads(ws.recv())
-        if msg.get("type") == "AUTH_STATE":
-            if msg["state"] == "UNAUTHORIZED":
-                ws.send(json.dumps({"type": "AUTH", "channel": 0, "token": token}))
-            elif msg["state"] == "AUTHORIZED":
-                break
-    ws.send(json.dumps({"type": "CHANNEL_REQUEST", "channel": 1,
-                        "service": "FEED", "parameters": {"contract": "AUTO"}}))
-    ws.recv()
-    return ws
-
-
+def connect_websocket(token, retries=3):
+    """Conecta ao dxFeed WebSocket com retry automatico."""
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            ws = create_connection(DXFEED_URL, timeout=30)  # timeout aumentado
+            ws.send(json.dumps({
+                "type": "SETUP", "channel": 0,
+                "keepaliveTimeout": 60, "acceptKeepaliveTimeout": 60, "version": "1.0.0"
+            }))
+            ws.recv()
+ 
+            # Auth loop com timeout individual por mensagem
+            ws.settimeout(15)
+            auth_attempts = 0
+            while auth_attempts < 10:
+                try:
+                    msg = json.loads(ws.recv())
+                except Exception:
+                    break
+                if msg.get("type") == "AUTH_STATE":
+                    if msg["state"] == "UNAUTHORIZED":
+                        ws.send(json.dumps({"type": "AUTH", "channel": 0, "token": token}))
+                    elif msg["state"] == "AUTHORIZED":
+                        break
+                auth_attempts += 1
+ 
+            ws.send(json.dumps({
+                "type": "CHANNEL_REQUEST", "channel": 1,
+                "service": "FEED", "parameters": {"contract": "AUTO"}
+            }))
+            ws.settimeout(10)
+            ws.recv()
+            return ws
+ 
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(2 * attempt)   # backoff: 2s, 4s
+                continue
+ 
+    raise Exception(
+        f"Nao foi possivel conectar ao dxFeed apos {retries} tentativas. "
+        f"Ultimo erro: {last_error}"
+    )
+ 
+ 
 def get_underlying_price(ws, symbol):
     ws.send(json.dumps({"type": "FEED_SUBSCRIPTION", "channel": 1,
                         "add": [{"symbol": symbol, "type": "Trade"},
                                 {"symbol": symbol, "type": "Quote"}]}))
     trade_price = quote_mid = None
     start = time.time()
-    while time.time() - start < 5:
+    while time.time() - start < 10:   # aumentado de 5 para 10s
         try:
-            ws.settimeout(1)
+            ws.settimeout(2)
             msg = json.loads(ws.recv())
             if msg.get("type") == "FEED_DATA":
                 for data in msg.get("data", []):
@@ -277,8 +306,8 @@ def get_underlying_price(ws, symbol):
         except Exception:
             continue
     return trade_price or quote_mid
-
-
+ 
+ 
 def generate_option_symbols(center_price, option_prefix, expiration,
                              strikes_up, strikes_down, increment):
     center = round(center_price / increment) * increment
@@ -289,8 +318,8 @@ def generate_option_symbols(center_price, option_prefix, expiration,
         options.append(f".{option_prefix}{expiration}C{strike_str}")
         options.append(f".{option_prefix}{expiration}P{strike_str}")
     return options
-
-
+ 
+ 
 def fetch_option_data(ws, symbols, wait_seconds=15):
     """Coleta Greeks (gamma+delta+IV), OI e Volume via WebSocket."""
     # Envia em lotes de 200 para respeitar limites do dxFeed
@@ -302,12 +331,12 @@ def fetch_option_data(ws, symbols, wait_seconds=15):
                          {"symbol": sym, "type": "Summary"},
                          {"symbol": sym, "type": "Trade"}])
         ws.send(json.dumps({"type": "FEED_SUBSCRIPTION", "channel": 1, "add": subs}))
-
+ 
     data = {}
     start = time.time()
     while time.time() - start < wait_seconds:
         try:
-            ws.settimeout(0.5)
+            ws.settimeout(1)
             msg = json.loads(ws.recv())
             if msg.get("type") == "FEED_DATA":
                 for item in msg.get("data", []):
@@ -328,8 +357,8 @@ def fetch_option_data(ws, symbols, wait_seconds=15):
         except Exception:
             continue
     return data
-
-
+ 
+ 
 def aggregate_by_strike(option_data):
     strike_data = {}
     for symbol, data in option_data.items():
@@ -383,8 +412,8 @@ def aggregate_by_strike(option_data):
          "total_volume": d["call_volume"] + d["put_volume"]}
         for s, d in strike_data.items()
     ]).sort_values("strike").reset_index(drop=True)
-
-
+ 
+ 
 # Chart builders
 def build_exposure_chart(df, col_call, col_put, col_net,
                          spot, zero_level, symbol, exp_label, label, chart_type):
@@ -411,8 +440,8 @@ def build_exposure_chart(df, col_call, col_put, col_net,
                       xaxis_title="Strike", yaxis_title=f"{label} ($)",
                       barmode=barmode, template="plotly_white", height=500)
     return fig
-
-
+ 
+ 
 def build_iv_chart(strike_df, spot, symbol, exp_label):
     fig = go.Figure()
     call_iv = strike_df[strike_df["call_iv"].notna()]
@@ -431,8 +460,8 @@ def build_iv_chart(strike_df, spot, symbol, exp_label):
                       xaxis_title="Strike", yaxis_title="IV (%)",
                       template="plotly_white", height=400, hovermode="x unified")
     return fig
-
-
+ 
+ 
 def build_oi_chart(strike_df, spot):
     fig = go.Figure()
     fig.add_trace(go.Bar(x=strike_df["strike"], y=strike_df["call_oi"],
@@ -445,8 +474,8 @@ def build_oi_chart(strike_df, spot):
                       yaxis_title="Open Interest", barmode="relative",
                       template="plotly_white", height=400)
     return fig
-
-
+ 
+ 
 def build_volume_chart(strike_df, spot, view):
     fig = go.Figure()
     if view == "Calls vs Puts":
@@ -466,8 +495,8 @@ def build_volume_chart(strike_df, spot, view):
                       yaxis_title="Volume", barmode=barmode,
                       template="plotly_white", height=400)
     return fig
-
-
+ 
+ 
 def fmt_table(df_in, cols):
     out = df_in[list(cols.keys())].copy()
     for col in cols:
@@ -477,23 +506,23 @@ def fmt_table(df_in, cols):
             out[col] = out[col].apply(lambda x: f"${x:,.0f}")
     out.columns = list(cols.values())
     return out
-
-
+ 
+ 
 def exp_label(exp_str: str) -> str:
     """Converte YYMMDD para display legivel."""
     try:
         return datetime.strptime(exp_str, "%y%m%d").strftime("%b %d, %Y")
     except Exception:
         return exp_str
-
-
+ 
+ 
 # =============================================================================
 # Main
 # =============================================================================
 def main():
     st.title("\U0001f4ca GEX + DEX Dashboard")
     st.caption("Gamma Exposure e Delta Exposure em tempo real — single ou acumulado por vencimento")
-
+ 
     for k, v in {
         "data_fetched":          False,
         "gex_calculator":        None,
@@ -510,13 +539,13 @@ def main():
     }.items():
         if k not in st.session_state:
             st.session_state[k] = v
-
+ 
     # =========================================================================
     # Sidebar
     # =========================================================================
     with st.sidebar:
         st.header("\u2699\ufe0f Configuracao")
-
+ 
         symbol = st.selectbox(
             "Underlying Symbol",
             list(PRESET_SYMBOLS.keys()),
@@ -530,14 +559,14 @@ def main():
         default_price = preset["default_price"]
         increment     = preset["increment"]
         st.session_state.symbol = symbol
-
+ 
         # ── Modo de coleta ────────────────────────────────────────────────────
         st.subheader("Modo")
         modo = st.radio("Modo de coleta",
                         ["Vencimento unico", "Acumulado (multiplos vencimentos)"],
                         index=0)
         is_acumulado = (modo == "Acumulado (multiplos vencimentos)")
-
+ 
         # ── Expiracao ─────────────────────────────────────────────────────────
         st.subheader("\U0001f4c5 Expiracao")
         if not is_acumulado:
@@ -554,24 +583,24 @@ def main():
                 expiration = custom_date.strftime("%y%m%d")
             st.session_state.expiration = expiration
             st.caption(f"Vencimento: {exp_label(expiration)}")
-
+ 
         else:
             # Acumulado: mostra todos os vencimentos reais
             all_exps_full = generate_expirations_full(365)
-
+ 
             # Agrupa por categoria para facilitar selecao
             from datetime import date as _date
             today_d = datetime.now().date()
             cut35   = today_d + timedelta(days=35)
             cut90   = today_d + timedelta(days=90)
-
+ 
             def _cat(e):
                 d = datetime.strptime(e, "%y%m%d").date()
                 if d == today_d:         return "0DTE (hoje)"
                 elif d <= cut35:         return "Diarios (ate 5 sem)"
                 elif d <= cut90:         return "Semanais (5 sem - 90d)"
                 else:                    return "Mensais (90d+)"
-
+ 
             # Filtro por categoria
             cats_disponiveis = ["0DTE (hoje)", "Diarios (ate 5 sem)",
                                 "Semanais (5 sem - 90d)", "Mensais (90d+)"]
@@ -581,9 +610,9 @@ def main():
                 default=["0DTE (hoje)", "Diarios (ate 5 sem)", "Semanais (5 sem - 90d)", "Mensais (90d+)"],
                 help="Selecione quais grupos de vencimento incluir no acumulado."
             )
-
+ 
             all_exps_filtered = [e for e in all_exps_full if _cat(e) in cats_sel]
-
+ 
             # Multiselect individual (com todos pre-selecionados)
             all_exps = st.multiselect(
                 f"Vencimentos ({len(all_exps_filtered)} disponiveis)",
@@ -595,7 +624,7 @@ def main():
                 ),
                 help="Desmarque vencimentos especificos para excluir da coleta."
             )
-
+ 
             if all_exps:
                 st.caption(
                     f"{len(all_exps)} vencimentos selecionados: "
@@ -603,12 +632,12 @@ def main():
                 )
             else:
                 st.warning("Selecione ao menos um vencimento.")
-
+ 
         # ── Strikes ───────────────────────────────────────────────────────────
         st.subheader("\U0001f3af Strikes")
         strikes_up   = st.number_input("Strikes acima",  min_value=5, max_value=100, value=25, step=5)
         strikes_down = st.number_input("Strikes abaixo", min_value=5, max_value=100, value=25, step=5)
-
+ 
         # ── Coleta ────────────────────────────────────────────────────────────
         st.subheader("\U0001f504 Coleta de Dados")
         if not is_acumulado:
@@ -620,12 +649,12 @@ def main():
                 help="Cada vencimento recebe este tempo de escuta. "
                      "Total = N vencimentos x segundos."
             )
-
+ 
         auto_refresh = st.checkbox("Auto-refresh", value=st.session_state.auto_refresh)
         st.session_state.auto_refresh = auto_refresh
-
+ 
         st.divider()
-
+ 
         btn_label    = "\U0001f504 Buscar Dados" if not is_acumulado else "\U0001f504 Buscar Acumulado"
         btn_disabled = is_acumulado and (not all_exps if is_acumulado else False)
         if st.button(btn_label, type="primary", use_container_width=True,
@@ -634,7 +663,7 @@ def main():
                 try:
                     token = ensure_streamer_token()
                     ws    = connect_websocket(token)
-
+ 
                     # Preco do underlying
                     st.info(f"Buscando preco de {symbol}...")
                     price = get_underlying_price(ws, symbol)
@@ -643,7 +672,7 @@ def main():
                         price = default_price
                     st.session_state.underlying_price = price
                     st.success(f"{symbol}: ${price:,.2f}")
-
+ 
                     if not is_acumulado:
                         # ── Modo vencimento unico ─────────────────────────────
                         options = generate_option_symbols(
@@ -653,7 +682,7 @@ def main():
                         st.info(f"Coletando {len(options)} opcoes por {wait_seconds}s...")
                         option_data = fetch_option_data(ws, options, wait_seconds)
                         ws.close()
-
+ 
                         gex_calc = GEXCalculator(spot_price=price)
                         dex_calc = DEXCalculator(spot_price=price)
                         for sym_str, d in option_data.items():
@@ -662,7 +691,7 @@ def main():
                                 gex_calc.update_gamma(sym_str, g, oi)
                             if delta is not None and oi is not None:
                                 dex_calc.update_delta(sym_str, delta, oi)
-
+ 
                         st.session_state.gex_calculator        = gex_calc
                         st.session_state.dex_calculator        = dex_calc
                         st.session_state.option_data           = option_data
@@ -671,7 +700,7 @@ def main():
                         st.session_state.acum_breakdown        = {}
                         st.session_state.data_fetched          = True
                         st.success("\u2705 Dados coletados!")
-
+ 
                     else:
                         # ── Modo acumulado ─────────────────────────────────────
                         gex_acum     = GEXCalculator(spot_price=price)
@@ -679,7 +708,7 @@ def main():
                         all_data     = {}
                         breakdown    = {}
                         progress_bar = st.progress(0, text="Iniciando coleta acumulada...")
-
+ 
                         for idx, exp_str in enumerate(all_exps):
                             pct = int(idx / len(all_exps) * 100)
                             progress_bar.progress(
@@ -692,7 +721,7 @@ def main():
                             )
                             exp_data = fetch_option_data(ws, options, wait_per_exp)
                             all_data.update(exp_data)
-
+ 
                             # Calculadores individuais para breakdown
                             gex_exp = GEXCalculator(spot_price=price)
                             dex_exp = DEXCalculator(spot_price=price)
@@ -705,10 +734,10 @@ def main():
                                     dex_exp.update_delta(sym_str, delta, oi)
                                     dex_acum.update_delta(sym_str, delta, oi)
                             breakdown[exp_str] = {"gex": gex_exp, "dex": dex_exp}
-
+ 
                         ws.close()
                         progress_bar.progress(100, text="Calculando exposicao acumulada...")
-
+ 
                         st.session_state.gex_calculator        = gex_acum
                         st.session_state.dex_calculator        = dex_acum
                         st.session_state.option_data           = all_data
@@ -721,11 +750,11 @@ def main():
                             f"\u2705 Acumulado: {len(all_exps)} vencimentos, "
                             f"{len(all_data)} opcoes rastreadas."
                         )
-
+ 
                 except Exception as e:
                     st.error(f"Erro: {e}")
                     st.session_state.data_fetched = False
-
+ 
     # =========================================================================
     # Tela inicial
     # =========================================================================
@@ -741,7 +770,7 @@ def main():
 - **IV Skew**
         """)
         return
-
+ 
     # =========================================================================
     # Dashboard
     # =========================================================================
@@ -755,14 +784,14 @@ def main():
     is_acum   = st.session_state.is_acumulado
     acum_exps = st.session_state.acum_expirations_used
     breakdown = st.session_state.acum_breakdown
-
+ 
     if is_acum:
         exp_lbl = f"{len(acum_exps)} vencimentos acumulados ({exp_label(acum_exps[0])} → {exp_label(acum_exps[-1])})"
         st.info(f"**Modo Acumulado** — {exp_lbl}")
     else:
         exp_lbl = exp_label(st.session_state.expiration)
         st.info(f"**Vencimento:** {exp_lbl}")
-
+ 
     # Header metrics
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1:
@@ -783,9 +812,9 @@ def main():
         zd = dex_m.get("zero_delta")
         st.metric("Zero Delta", f"${zd:,.2f}" if zd else "N/A",
                   help="Strike onde Net DEX = 0")
-
+ 
     st.divider()
-
+ 
     tab_gex, tab_dex, tab_acum, tab_oi, tab_iv = st.tabs([
         "\U0001f4ca Gamma Exposure (GEX)",
         "\U0001f4d0 Delta Exposure (DEX)",
@@ -793,7 +822,7 @@ def main():
         "\U0001f4c9 Volume & OI",
         "\U0001f4c8 IV Skew",
     ])
-
+ 
     # ── TAB GEX ──────────────────────────────────────────────────────────────
     with tab_gex:
         gex_df = gex_calc.get_gex_by_strike()
@@ -829,7 +858,7 @@ def main():
             with t2:
                 st.dataframe(fmt_table(gex_df.nlargest(15, "put_gex"), cols_g),
                              hide_index=True, use_container_width=True)
-
+ 
     # ── TAB DEX ──────────────────────────────────────────────────────────────
     with tab_dex:
         dex_df = dex_calc.get_dex_by_strike()
@@ -878,10 +907,10 @@ def main():
 | **Call DEX** | exposicao comprada |
 | **Put DEX** | exposicao vendida |
 | **Net DEX** | `Call DEX - Put DEX` |
-
+ 
 **Zero Delta**: acima → dealers comprados (mercado estabiliza) | abaixo → dealers vendidos (amplificam)
             """)
-
+ 
     # ── TAB ACUMULADO ─────────────────────────────────────────────────────────
     with tab_acum:
         if not is_acum or not breakdown:
@@ -889,7 +918,7 @@ def main():
         else:
             st.subheader(f"Breakdown por vencimento — {sym}")
             st.caption(f"{len(acum_exps)} vencimentos | spot: ${spot:,.2f}")
-
+ 
             # Tabela resumo
             rows = []
             for exp_str in acum_exps:
@@ -912,9 +941,9 @@ def main():
                 })
             if rows:
                 st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-
+ 
             st.divider()
-
+ 
             # Graficos por vencimento
             st.subheader("GEX por vencimento")
             view_exp = st.selectbox(
@@ -929,7 +958,7 @@ def main():
                 ddf = bd["dex"].get_dex_by_strike()
                 gm2 = bd["gex"].get_total_gex_metrics()
                 dm2 = bd["dex"].get_total_dex_metrics()
-
+ 
                 c_g, c_d = st.columns(2)
                 with c_g:
                     if not gdf.empty:
@@ -951,7 +980,7 @@ def main():
                                 spot, dm2.get("zero_delta"), sym,
                                 exp_label(view_exp), "DEX", ct_d),
                             use_container_width=True)
-
+ 
     # ── TAB OI & VOLUME ───────────────────────────────────────────────────────
     with tab_oi:
         if strike_df.empty:
@@ -979,7 +1008,7 @@ def main():
                 top["strike"] = top["strike"].apply(lambda x: f"${x:,.2f}")
                 top.columns = ["Strike", "Call Vol", "Put Vol", "Total Vol"]
                 st.dataframe(top, hide_index=True, use_container_width=True)
-
+ 
     # ── TAB IV SKEW ───────────────────────────────────────────────────────────
     with tab_iv:
         has_iv = (not strike_df.empty and
@@ -989,11 +1018,12 @@ def main():
         else:
             st.plotly_chart(build_iv_chart(strike_df, spot, sym, exp_lbl),
                             use_container_width=True)
-
+ 
     if st.session_state.auto_refresh:
         time.sleep(1)
         st.rerun()
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
+
